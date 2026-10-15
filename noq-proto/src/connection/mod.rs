@@ -32,7 +32,7 @@ use crate::{
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     config::{ServerConfig, TransportConfig},
-    congestion::Controller,
+    congestion::{self, Controller},
     connection::{
         paths::PathRetransmits,
         qlog::{QlogRecvPacket, QlogSink},
@@ -878,6 +878,27 @@ impl Connection {
     pub fn set_path_priority(&mut self, path_id: PathId, priority: u8) -> Result<u8, ClosedPath> {
         let path = self.path_mut(path_id).ok_or(ClosedPath { _private: () })?;
         Ok(mem::replace(&mut path.priority, priority))
+    }
+
+    /// Uses a congestion controller from `factory` on a known [`PathId`], in place of the
+    /// connection's [`TransportConfig::congestion_controller_factory`]
+    ///
+    /// The path's current controller is replaced right away by a fresh one, and the path
+    /// keeps using `factory` for the rest of its life, including after migrations. Packets
+    /// already in flight are accounted to the new controller as they are acknowledged or
+    /// lost. Like the priority, this is purely local: the peer's congestion control of what
+    /// it sends on the path is unaffected.
+    ///
+    /// [`TransportConfig::congestion_controller_factory`]: crate::TransportConfig::congestion_controller_factory
+    pub fn set_path_congestion_controller(
+        &mut self,
+        now: Instant,
+        path_id: PathId,
+        factory: Arc<dyn congestion::ControllerFactory + Send + Sync>,
+    ) -> Result<(), ClosedPath> {
+        let path = self.path_mut(path_id).ok_or(ClosedPath { _private: () })?;
+        path.set_congestion_factory(paths::PathControllerFactory(factory), now);
+        Ok(())
     }
 
     /// Returns the remote path status
@@ -5889,14 +5910,16 @@ impl Connection {
             let peer_max_udp_payload_size =
                 u16::try_from(self.peer_params.max_udp_payload_size.into_inner())
                     .unwrap_or(u16::MAX);
-            PathData::new(
+            let mut data = PathData::new(
                 network_path,
                 self.allow_mtud,
                 Some(peer_max_udp_payload_size),
                 self.path_generation_counter,
                 now,
                 &self.config,
-            )
+            );
+            data.inherit_local_settings(&path.data, now);
+            data
         };
         new_path_data.last_observed_addr_report = path.data.last_observed_addr_report.clone();
         if let Some(report) = observed_addr
