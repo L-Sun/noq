@@ -2432,3 +2432,106 @@ fn regression_discarded_path_stats_are_up_to_date() -> TestResult {
 
     Ok(())
 }
+
+/// A congestion controller with a fixed window, to tell which controller a path uses
+#[derive(Debug, Clone)]
+struct FixedWindow(u64);
+
+impl crate::congestion::Controller for FixedWindow {
+    fn on_congestion_event(
+        &mut self,
+        _now: crate::Instant,
+        _sent: crate::Instant,
+        _is_persistent_congestion: bool,
+        _is_ecn: bool,
+        _lost_bytes: u64,
+        _largest_lost_pn: u64,
+    ) {
+    }
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        self.0
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::congestion::Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.0
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn core::any::Any> {
+        self
+    }
+}
+
+impl crate::congestion::ControllerFactory for FixedWindow {
+    fn build(
+        self: Arc<Self>,
+        _now: crate::Instant,
+        _current_mtu: u16,
+    ) -> Box<dyn crate::congestion::Controller> {
+        Box::new((*self).clone())
+    }
+}
+
+const FIXED_WINDOW: u64 = 123_456;
+
+#[test]
+fn path_congestion_controller_applies_to_its_path() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    let server_addr = pair.routes.public_server_addr();
+    let path_1 = pair.open_path(
+        Client,
+        FourTuple::from_remote(server_addr),
+        PathStatus::Available,
+    )?;
+    pair.drive();
+
+    let now = pair.time;
+    pair.conn_mut(Client).set_path_congestion_controller(
+        now,
+        path_1,
+        Arc::new(FixedWindow(FIXED_WINDOW)),
+    )?;
+    let s = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, s).write(b"hello")?;
+    pair.drive();
+
+    let conn = pair.conn_mut(Client);
+    assert_eq!(conn.path_stats(path_1).unwrap().cwnd, FIXED_WINDOW);
+    assert_ne!(conn.path_stats(PathId::ZERO).unwrap().cwnd, FIXED_WINDOW);
+    Ok(())
+}
+
+/// A migration to a new peer IP starts the path afresh, but keeps the path's local
+/// priority and congestion controller.
+#[test]
+fn path_settings_survive_migration_to_a_new_ip() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder().connect();
+    let now = pair.time;
+    let server = pair.conn_mut(Server);
+    server.set_path_priority(PathId::ZERO, 3)?;
+    server.set_path_congestion_controller(
+        now,
+        PathId::ZERO,
+        Arc::new(FixedWindow(FIXED_WINDOW)),
+    )?;
+    let old_remote = server.network_path(PathId::ZERO)?.remote;
+
+    let client_addr = pair.routes.as_basic_mut().passive_migration(Client);
+    assert_ne!(client_addr.ip(), old_remote.ip());
+    pair.conn_mut(Client).ping();
+    pair.drive();
+
+    let server = pair.conn_mut(Server);
+    assert_eq!(server.network_path(PathId::ZERO)?.remote, client_addr);
+    assert_eq!(server.path_priority(PathId::ZERO)?, 3);
+    assert_eq!(server.path_stats(PathId::ZERO).unwrap().cwnd, FIXED_WINDOW);
+    Ok(())
+}

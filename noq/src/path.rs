@@ -196,6 +196,20 @@ impl Path {
             .set_path_priority(self.id(), priority)
     }
 
+    /// Uses a congestion controller from `factory` on this path instead of the connection's.
+    ///
+    /// See [`proto::Connection::set_path_congestion_controller`].
+    pub fn set_congestion_controller(
+        &self,
+        factory: Arc<dyn proto::congestion::ControllerFactory + Send + Sync>,
+    ) -> Result<(), ClosedPath> {
+        let mut state = self.conn.lock_and_wake("set path congestion controller");
+        let now = state.runtime.now();
+        state
+            .inner
+            .set_path_congestion_controller(now, self.id(), factory)
+    }
+
     /// Returns the [`PathStats`] for this path.
     pub fn stats(&self) -> PathStats {
         // The `expect` is safe:

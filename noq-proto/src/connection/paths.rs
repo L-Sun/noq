@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{cmp, net::SocketAddr};
 
 use identity_hash::IntMap;
@@ -159,6 +159,18 @@ pub(super) struct SentChallengeInfo {
 ///
 /// [`PacketSpace::number_spaces`]: super::spaces::PacketSpace::number_spaces
 /// [`Connection::paths`]: super::Connection::paths
+/// A path's own congestion controller factory, see [`PathData::congestion_factory`]
+#[derive(Clone)]
+pub(super) struct PathControllerFactory(
+    pub(super) Arc<dyn congestion::ControllerFactory + Send + Sync>,
+);
+
+impl core::fmt::Debug for PathControllerFactory {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("PathControllerFactory")
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct PathData {
     pub(super) network_path: FourTuple,
@@ -231,6 +243,11 @@ pub(super) struct PathData {
     ///
     /// See [`super::Connection::set_path_priority`].
     pub(super) priority: u8,
+    /// Congestion controller for this path in place of the connection's, if set
+    ///
+    /// See [`super::Connection::set_path_congestion_controller`]. Kept across migrations,
+    /// which rebuild the controller from it.
+    pub(super) congestion_factory: Option<PathControllerFactory>,
     /// Number of the first packet sent on this path
     ///
     /// With RFC9000 §9 style migration (i.e. not multipath) the PathId does not change and
@@ -344,6 +361,7 @@ impl PathData {
             last_observed_addr_report: None,
             status: Default::default(),
             priority: 0,
+            congestion_factory: None,
             first_packet: None,
             pto_count: 0,
             idle_timeout: config.default_path_max_idle_timeout,
@@ -393,6 +411,7 @@ impl PathData {
             last_observed_addr_report: None,
             status: prev.status.clone(),
             priority: prev.priority,
+            congestion_factory: prev.congestion_factory.clone(),
             first_packet: None,
             pto_count: 0,
             idle_timeout: prev.idle_timeout,
@@ -403,6 +422,25 @@ impl PathData {
             recovery_metrics: prev.recovery_metrics.clone(),
             generation,
         }
+    }
+
+    /// Carry the locally configured scheduling priority and congestion controller over from
+    /// the path this one replaces
+    ///
+    /// For migrations that start from a fresh [`PathData::new`] rather than
+    /// [`PathData::from_previous`]: the controller is rebuilt from the path's factory, if it
+    /// has one.
+    pub(super) fn inherit_local_settings(&mut self, prev: &Self, now: Instant) {
+        self.priority = prev.priority;
+        if let Some(factory) = prev.congestion_factory.clone() {
+            self.set_congestion_factory(factory, now);
+        }
+    }
+
+    /// Replace this path's congestion controller with a fresh one from `factory`
+    pub(super) fn set_congestion_factory(&mut self, factory: PathControllerFactory, now: Instant) {
+        self.congestion = factory.0.clone().build(now, self.current_mtu());
+        self.congestion_factory = Some(factory);
     }
 
     /// Whether we're in the process of validating this path with PATH_CHALLENGEs
