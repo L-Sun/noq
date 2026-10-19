@@ -1,8 +1,9 @@
 use super::*;
-use std::eprintln;
 
 #[test]
-fn rapidmasque_diag_idle_then_datagrams() {
+fn bbr3_datagrams_recover_after_idle_keepalives() {
+    // Sparse keepalives must stay app-limited so their delivery rate cannot
+    // prematurely end STARTUP and collapse the window before application traffic.
     for idle_seconds in [0u64, 10, 30] {
         let mut bbr = crate::congestion::Bbr3Config::default();
         bbr.initial_window(512 * 1024);
@@ -24,28 +25,11 @@ fn rapidmasque_diag_idle_then_datagrams() {
             .connect();
         let mut received = 0;
         let mut sent = 0;
+        // Send 400 datagrams/s for 12 seconds, then allow one second to drain.
         for tick in 0..((idle_seconds + 13) * 4000) {
             if tick % 4000 == 0 {
                 pair.ping(Client);
                 pair.ping(Server);
-                if tick % 20000 == 0 {
-                    let c = pair
-                        .congestion_state(Client, PathId::ZERO)
-                        .unwrap()
-                        .metrics();
-                    let s = pair
-                        .congestion_state(Server, PathId::ZERO)
-                        .unwrap()
-                        .metrics();
-                    eprintln!(
-                        "idle={idle_seconds} t={} client=({}, {:?}) server=({}, {:?})",
-                        tick / 4000,
-                        c.congestion_window,
-                        c.pacing_rate,
-                        s.congestion_window,
-                        s.pacing_rate
-                    );
-                }
             }
             if tick >= idle_seconds * 4000 && tick < (idle_seconds + 12) * 4000 && tick % 10 == 0 {
                 pair.datagrams(Client)
@@ -63,11 +47,7 @@ fn rapidmasque_diag_idle_then_datagrams() {
             }
             pair.time += Duration::from_micros(250);
         }
-        eprintln!(
-            "RESULT idle={idle_seconds} sent={sent} received={received} client={:?} server={:?}",
-            pair.stats(Client),
-            pair.stats(Server)
-        );
+        assert_eq!(sent, 4800);
         assert!(
             received > sent * 9 / 10,
             "idle={idle_seconds} got {received}/{sent}"
