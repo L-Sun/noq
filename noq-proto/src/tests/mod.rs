@@ -44,6 +44,7 @@ use crate::{
 };
 
 mod util;
+mod rapidmasque_diag;
 pub(crate) use util::subscribe;
 use util::{
     CERTIFIED_KEY, ConnPair, DEFAULT_MTU, IncomingConnectionBehavior, Pair, client_config,
